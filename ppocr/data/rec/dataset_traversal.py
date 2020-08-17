@@ -13,6 +13,7 @@
 #limitations under the License.
 
 import os
+import sys
 import math
 import random
 import numpy as np
@@ -25,7 +26,7 @@ from ppocr.utils.utility import initial_logger
 from ppocr.utils.utility import get_image_file_list
 logger = initial_logger()
 
-from .img_tools import process_image, get_img_data
+from .img_tools import process_image, process_image_srn, get_img_data
 
 
 class LMDBReader(object):
@@ -40,10 +41,28 @@ class LMDBReader(object):
         self.loss_type = params['loss_type']
         self.max_text_length = params['max_text_length']
         self.mode = params['mode']
+        self.drop_last = False
+        self.use_tps = False
+        self.num_heads = None
+        if "num_heads" in params:
+            self.num_heads = params['num_heads']
+        if "tps" in params:
+            self.ues_tps = True
+        self.use_distort = False
+        if "distort" in params:
+            self.use_distort = params['distort'] and params['use_gpu']
+            if not params['use_gpu']:
+                logger.info(
+                    "Distort operation can only support in GPU. Distort will be set to False."
+                )
         if params['mode'] == 'train':
             self.batch_size = params['train_batch_size_per_card']
+            self.drop_last = True
         else:
             self.batch_size = params['test_batch_size_per_card']
+            self.drop_last = False
+            self.use_distort = False
+        self.infer_img = params['infer_img']
 
     def load_hierarchical_lmdb_dataset(self):
         lmdb_sets = {}
@@ -97,33 +116,70 @@ class LMDBReader(object):
             process_id = 0
 
         def sample_iter_reader():
-            lmdb_sets = self.load_hierarchical_lmdb_dataset()
-            if process_id == 0:
-                self.print_lmdb_sets_info(lmdb_sets)
-            cur_index_sets = [1 + process_id] * len(lmdb_sets)
-            while True:
-                finish_read_num = 0
-                for dataset_idx in range(len(lmdb_sets)):
-                    cur_index = cur_index_sets[dataset_idx]
-                    if cur_index > lmdb_sets[dataset_idx]['num_samples']:
-                        finish_read_num += 1
+            if self.mode != 'train' and self.infer_img is not None:
+                image_file_list = get_image_file_list(self.infer_img)
+                for single_img in image_file_list:
+                    img = cv2.imread(single_img)
+                    if img.shape[-1] == 1 or len(list(img.shape)) == 2:
+                        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+                    if self.loss_type == 'srn':
+                        norm_img = process_image_srn(
+                            img=img,
+                            image_shape=self.image_shape,
+                            num_heads=self.num_heads,
+                            max_text_length=self.max_text_length)
                     else:
-                        sample_info = self.get_lmdb_sample_info(
-                            lmdb_sets[dataset_idx]['txn'], cur_index)
-                        cur_index_sets[dataset_idx] += self.num_workers
-                        if sample_info is None:
-                            continue
-                        img, label = sample_info
-                        outs = process_image(img, self.image_shape, label,
-                                             self.char_ops, self.loss_type,
-                                             self.max_text_length)
-                        if outs is None:
-                            continue
-                        yield outs
+                        norm_img = process_image(
+                            img=img,
+                            image_shape=self.image_shape,
+                            char_ops=self.char_ops,
+                            tps=self.use_tps,
+                            infer_mode=True)
+                    yield norm_img
+            else:
+                lmdb_sets = self.load_hierarchical_lmdb_dataset()
+                if process_id == 0:
+                    self.print_lmdb_sets_info(lmdb_sets)
+                cur_index_sets = [1 + process_id] * len(lmdb_sets)
+                while True:
+                    finish_read_num = 0
+                    for dataset_idx in range(len(lmdb_sets)):
+                        cur_index = cur_index_sets[dataset_idx]
+                        if cur_index > lmdb_sets[dataset_idx]['num_samples']:
+                            finish_read_num += 1
+                        else:
+                            sample_info = self.get_lmdb_sample_info(
+                                lmdb_sets[dataset_idx]['txn'], cur_index)
+                            cur_index_sets[dataset_idx] += self.num_workers
+                            if sample_info is None:
+                                continue
+                            img, label = sample_info
+                            outs = []
+                            if self.loss_type == "srn":
+                                outs = process_image_srn(
+                                    img=img,
+                                    image_shape=self.image_shape,
+                                    num_heads=self.num_heads,
+                                    max_text_length=self.max_text_length,
+                                    label=label,
+                                    char_ops=self.char_ops,
+                                    loss_type=self.loss_type)
 
-                if finish_read_num == len(lmdb_sets):
-                    break
-            self.close_lmdb_dataset(lmdb_sets)
+                            else:
+                                outs = process_image(
+                                    img=img,
+                                    image_shape=self.image_shape,
+                                    label=label,
+                                    char_ops=self.char_ops,
+                                    loss_type=self.loss_type,
+                                    max_text_length=self.max_text_length)
+                            if outs is None:
+                                continue
+                            yield outs
+
+                    if finish_read_num == len(lmdb_sets):
+                        break
+                self.close_lmdb_dataset(lmdb_sets)
 
         def batch_iter_reader():
             batch_outs = []
@@ -132,10 +188,13 @@ class LMDBReader(object):
                 if len(batch_outs) == self.batch_size:
                     yield batch_outs
                     batch_outs = []
-            if len(batch_outs) != 0:
-                yield batch_outs
+            if not self.drop_last:
+                if len(batch_outs) != 0:
+                    yield batch_outs
 
-        return batch_iter_reader
+        if self.infer_img is None:
+            return batch_iter_reader
+        return sample_iter_reader
 
 
 class SimpleReader(object):
@@ -147,31 +206,57 @@ class SimpleReader(object):
         if params['mode'] != 'test':
             self.img_set_dir = params['img_set_dir']
             self.label_file_path = params['label_file_path']
+        self.use_gpu = params['use_gpu']
         self.char_ops = params['char_ops']
         self.image_shape = params['image_shape']
         self.loss_type = params['loss_type']
         self.max_text_length = params['max_text_length']
         self.mode = params['mode']
+        self.infer_img = params['infer_img']
+        self.use_tps = False
+        if "tps" in params:
+            self.use_tps = True
+        self.use_distort = False
+        if "distort" in params:
+            self.use_distort = params['distort'] and params['use_gpu']
+            if not params['use_gpu']:
+                logger.info(
+                    "Distort operation can only support in GPU.Distort will be set to False."
+                )
         if params['mode'] == 'train':
             self.batch_size = params['train_batch_size_per_card']
-        elif params['mode'] == 'eval':
-            self.batch_size = params['test_batch_size_per_card']
+            self.drop_last = True
         else:
-            self.batch_size = 1
-            self.infer_img = params['infer_img']
+            self.batch_size = params['test_batch_size_per_card']
+            self.drop_last = False
+            self.use_distort = False
 
     def __call__(self, process_id):
         if self.mode != 'train':
             process_id = 0
 
+        def get_device_num():
+            if self.use_gpu:
+                gpus = os.environ.get("CUDA_VISIBLE_DEVICES", 1)
+                gpu_num = len(gpus.split(','))
+                return gpu_num
+            else:
+                cpu_num = os.environ.get("CPU_NUM", 1)
+                return int(cpu_num)
+
         def sample_iter_reader():
-            if self.mode == 'test':
+            if self.mode != 'train' and self.infer_img is not None:
                 image_file_list = get_image_file_list(self.infer_img)
                 for single_img in image_file_list:
                     img = cv2.imread(single_img)
-                    if img.shape[-1]==1 or len(list(img.shape))==2:
+                    if img.shape[-1] == 1 or len(list(img.shape)) == 2:
                         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-                    norm_img = process_image(img, self.image_shape)
+                    norm_img = process_image(
+                        img=img,
+                        image_shape=self.image_shape,
+                        char_ops=self.char_ops,
+                        tps=self.use_tps,
+                        infer_mode=True)
                     yield norm_img
             else:
                 with open(self.label_file_path, "rb") as fin:
@@ -179,20 +264,36 @@ class SimpleReader(object):
                 img_num = len(label_infor_list)
                 img_id_list = list(range(img_num))
                 random.shuffle(img_id_list)
+                if sys.platform == "win32" and self.num_workers != 1:
+                    print("multiprocess is not fully compatible with Windows."
+                          "num_workers will be 1.")
+                    self.num_workers = 1
+                if self.batch_size * get_device_num(
+                ) * self.num_workers > img_num:
+                    raise Exception(
+                        "The number of the whole data ({}) is smaller than the batch_size * devices_num * num_workers ({})".
+                        format(img_num, self.batch_size * get_device_num() *
+                               self.num_workers))
                 for img_id in range(process_id, img_num, self.num_workers):
                     label_infor = label_infor_list[img_id_list[img_id]]
                     substr = label_infor.decode('utf-8').strip("\n").split("\t")
                     img_path = self.img_set_dir + "/" + substr[0]
                     img = cv2.imread(img_path)
-                    if img.shape[-1]==1 or len(list(img.shape))==2:
-                        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
                     if img is None:
                         logger.info("{} does not exist!".format(img_path))
                         continue
+                    if img.shape[-1] == 1 or len(list(img.shape)) == 2:
+                        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
                     label = substr[1]
-                    outs = process_image(img, self.image_shape, label,
-                                         self.char_ops, self.loss_type,
-                                         self.max_text_length)
+                    outs = process_image(
+                        img=img,
+                        image_shape=self.image_shape,
+                        label=label,
+                        char_ops=self.char_ops,
+                        loss_type=self.loss_type,
+                        max_text_length=self.max_text_length,
+                        distort=self.use_distort)
                     if outs is None:
                         continue
                     yield outs
@@ -204,9 +305,10 @@ class SimpleReader(object):
                 if len(batch_outs) == self.batch_size:
                     yield batch_outs
                     batch_outs = []
-            if len(batch_outs) != 0:
-                yield batch_outs
+            if not self.drop_last:
+                if len(batch_outs) != 0:
+                    yield batch_outs
 
-        if self.mode != 'test':
+        if self.infer_img is None:
             return batch_iter_reader
         return sample_iter_reader

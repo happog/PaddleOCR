@@ -16,14 +16,15 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import os
-import sys
-import time
 import numpy as np
 from copy import deepcopy
 import json
 
-# from paddle.fluid.contrib.model_stat import summary
+import os
+import sys
+__dir__ = os.path.dirname(__file__)
+sys.path.append(__dir__)
+sys.path.append(os.path.join(__dir__, '..'))
 
 
 def set_paddle_flags(**kwargs):
@@ -69,7 +70,7 @@ def draw_det_res(dt_boxes, config, img, img_name):
 def main():
     config = program.load_config(FLAGS.config)
     program.merge_config(FLAGS.opt)
-    print(config)
+    logger.info(config)
 
     # check if set use_gpu=True in paddlepaddle cpu version
     use_gpu = config['Global']['use_gpu']
@@ -106,7 +107,6 @@ def main():
     with open(save_res_path, "wb") as fout:
 
         test_reader = reader_main(config=config, mode='test')
-        # image_file_list = get_image_file_list(args.image_dir)
         tackling_num = 0
         for data in test_reader():
             img_num = len(data)
@@ -135,7 +135,7 @@ def main():
             elif config['Global']['algorithm'] == 'DB':
                 dic = {'maps': outs[0]}
             else:
-                raise Exception("only support algorithm: ['EAST', 'BD']")
+                raise Exception("only support algorithm: ['EAST', 'DB']")
             dt_boxes_list = postprocess(dic, ratio_list)
             for ino in range(img_num):
                 dt_boxes = dt_boxes_list[ino]

@@ -18,9 +18,9 @@ from __future__ import print_function
 
 import os
 import sys
-import time
-import multiprocessing
-import numpy as np
+__dir__ = os.path.dirname(__file__)
+sys.path.append(__dir__)
+sys.path.append(os.path.join(__dir__, '..'))
 
 
 def set_paddle_flags(**kwargs):
@@ -31,7 +31,7 @@ def set_paddle_flags(**kwargs):
 
 # NOTE(paddle-dev): All of these flags should be
 # set before `import paddle`. Otherwise, it would
-# not take any effect. 
+# not take any effect.
 set_paddle_flags(
     FLAGS_eager_delete_tensor_gb=0,  # enable GC to save memory
 )
@@ -41,28 +41,11 @@ from paddle import fluid
 from ppocr.utils.utility import initial_logger
 logger = initial_logger()
 from ppocr.utils.save_load import init_model
-from ppocr.utils.character import CharacterOps
-from ppocr.utils.utility import create_module
+
 
 
 def main():
-    config = program.load_config(FLAGS.config)
-    program.merge_config(FLAGS.opt)
-    logger.info(config)
-
-    # check if set use_gpu=True in paddlepaddle cpu version
-    use_gpu = config['Global']['use_gpu']
-    # program.check_gpu(True)
-    use_gpu = False
-
-    alg = config['Global']['algorithm']
-    assert alg in ['EAST', 'DB', 'Rosetta', 'CRNN', 'STARNet', 'RARE']
-    if alg in ['Rosetta', 'CRNN', 'STARNet', 'RARE']:
-        config['Global']['char_ops'] = CharacterOps(config['Global'])
-
-    place = fluid.CUDAPlace(0) if use_gpu else fluid.CPUPlace()
-    startup_prog = fluid.Program()
-    eval_program = fluid.Program()
+    startup_prog, eval_program, place, config, _ = program.preprocess()
 
     feeded_var_names, target_vars, fetches_var_name = program.build_export(
         config, eval_program, startup_prog)
@@ -89,6 +72,4 @@ def main():
 
 
 if __name__ == '__main__':
-    parser = program.ArgsParser()
-    FLAGS = parser.parse_args()
     main()
